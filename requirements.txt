@@ -6,6 +6,7 @@ uvicorn[standard]>=0.29,<1.0
 pydantic>=2.6,<3.0
 httpx>=0.27,<1.0        # real provider transport + Starlette TestClient
 numpy>=1.26,<3.0        # vector store (cosine similarity)
+prometheus-client>=0.20,<1.0   # /metrics Prometheus text exposition
 
 # --- test only ---
 pytest>=8.0,<9.0

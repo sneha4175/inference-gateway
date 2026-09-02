@@ -2,7 +2,8 @@
 
 Routes:
   GET  /health                 liveness
-  GET  /stats                  request/cache/token/cost counters
+  GET  /stats                  request/cache/token/cost/latency counters (JSON)
+  GET  /metrics                Prometheus text exposition of the same counters
   POST /v1/chat/completions    proxy a chat request (streaming optional)
   POST /rag/ingest             index documents
   POST /rag/query              retrieve + generate
@@ -14,9 +15,10 @@ across requests (they hold the cache, limiter buckets and vector store).
 from __future__ import annotations
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from app.config import Settings, build_gateway, build_rag
+from app.gateway.metrics import build_registry, render
 from app.gateway.router import AllProvidersFailed, Gateway, RateLimitExceeded
 from app.rag.pipeline import RagPipeline
 from app.schemas import (
@@ -32,13 +34,15 @@ from app.schemas import (
 app = FastAPI(
     title="AI Inference Gateway",
     description="LLM proxy with rate limiting, caching, fallback + a RAG route.",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 # Composition root: build shared singletons at import/startup.
 _settings = Settings.from_env()
 _gateway = build_gateway(_settings)
 _rag = build_rag(_settings, _gateway)
+# Prometheus registry bound to the shared gateway (scraped by GET /metrics).
+_metrics_registry = build_registry(_gateway)
 
 
 # Dependency-injection seams. Tests override these to inject their own stack.
@@ -67,6 +71,13 @@ def health() -> dict[str, str]:
 @app.get("/stats", response_model=Stats)
 def stats(gateway: Gateway = Depends(get_gateway)) -> Stats:
     return gateway.stats()
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    """Prometheus scrape endpoint. Same counters as /stats, machine-readable."""
+    body, content_type = render(_metrics_registry)
+    return Response(content=body, media_type=content_type)
 
 
 @app.post("/v1/chat/completions", response_model=ChatResponse)

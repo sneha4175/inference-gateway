@@ -33,6 +33,10 @@ class Usage(BaseModel):
     completion_tokens: int
     total_tokens: int
     cost_usd: float
+    # Wall-clock time the gateway spent serving THIS request, in milliseconds.
+    # Set by the gateway (providers leave it at the 0.0 default); a cache hit
+    # records a genuinely smaller value than the provider call it skipped.
+    latency_ms: float = 0.0
 
 
 class ChatResponse(BaseModel):
@@ -79,7 +83,13 @@ class RagQueryResponse(BaseModel):
 class Stats(BaseModel):
     requests: int
     cache_hits: int
+    cache_misses: int
     provider_errors: int
+    rate_limit_rejections: int
     total_prompt_tokens: int
     total_completion_tokens: int
     total_cost_usd: float
+    # Latency percentiles over a bounded rolling window of recent requests (ms).
+    latency_ms_p50: float
+    latency_ms_p95: float
+    latency_ms_avg: float
