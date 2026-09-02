@@ -68,7 +68,9 @@ def build_providers(settings: Settings) -> list[Provider]:
         )
         return [primary, MockProvider(name="mock-fallback")]
 
-    # Default offline stack: primary mock + a second mock for a visible chain.
+    # Default offline stack: a single mock provider (a one-element chain). The
+    # multi-provider fallback path is exercised with PROVIDER=openai and in
+    # tests/test_fallback.py.
     return [MockProvider(name="mock")]
 
 

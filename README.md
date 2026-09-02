@@ -3,8 +3,9 @@
 A small but real **AI inference gateway** written from scratch in Python / FastAPI.
 It sits in front of LLM providers and adds the operational glue you need before
 LLM calls are safe to expose to real traffic: **provider abstraction, per-key
-rate limiting, response caching, token/cost tracking, streaming, and provider
-fallback.** It also ships a **RAG route** (`/rag`) — document ingest → chunk →
+rate limiting, response caching, token/cost/latency tracking, streaming, provider
+fallback, and observability (`/stats` JSON + a Prometheus `/metrics` endpoint).**
+It also ships a **RAG route** (`/rag`) — document ingest → chunk →
 embed → vector store → retrieve → augment → generate — exposed through the *same*
 gateway so RAG answers inherit all of the above.
 
@@ -28,24 +29,28 @@ teams put an API gateway in front of microservices, applied to LLM traffic.
 ## Architecture
 
 ```
-                            ┌──────────────────────────────────────────────┐
-                            │                 FastAPI app                   │
-                            │                                               │
-   client ──► /v1/chat ─────┼─►  Gateway pipeline                           │
-                            │      1. rate limit (token bucket, per key)    │
-                            │      2. cache lookup (hash of model+messages)  │
-                            │      3. provider fallback chain ──┐            │
-                            │      4. cache store  + cost/token stats        │
-                            │                                   │            │
-   client ──► /rag/query ───┼─► RAG pipeline                    ▼            │
-                            │      embed query                Provider(s):   │
-                            │      retrieve top-k  ◄─ VectorStore  ├ Mock    │
-                            │      augment prompt  (NumPy cosine)  ├ OpenAI- │
-                            │      generate ──────────────────►────┘  compat │
-                            │                                               │
-   client ──► /rag/ingest ──┼─► chunk ─► embed ─► VectorStore               │
-                            └──────────────────────────────────────────────┘
+                                     ┌──────────────────────────────────────────────┐
+                                     │                 FastAPI app                  │
+                                     │                                              │
+   client ──► /v1/chat/completions ──┼─► Gateway pipeline                           │
+                                     │     1. rate limit (token bucket, per key)    │
+                                     │     2. cache lookup (hash of model+messages) │
+                                     │     3. provider(s): one, or a fallback chain │
+                                     │     4. cache store + cost/token/latency stats│
+                                     │                                              │
+   client ──► /rag/query ────────────┼─► RAG pipeline                               │
+                                     │     embed query               Provider(s):   │
+                                     │     retrieve top-k <- VectorStore  |- Mock   │
+                                     │     augment prompt (NumPy cosine)  \- OpenAI-│
+                                     │     generate ------------------->    compat  │
+                                     │                                              │
+   client ──► /rag/ingest ───────────┼─► chunk -> embed -> VectorStore              │
+                                     └──────────────────────────────────────────────┘
 ```
+
+The offline default runs a **single** mock provider — step 3 is a one-element
+chain. A real fallback chain (primary provider + a mock safety net) exists only
+with `PROVIDER=openai`, and is exercised directly in `tests/test_fallback.py`.
 
 Two halves, one pipeline:
 
@@ -96,7 +101,8 @@ curl -s localhost:8000/rag/ingest -H 'content-type: application/json' \
 curl -s localhost:8000/rag/query -H 'content-type: application/json' \
   -d '{"query":"What is the capital of Australia?","top_k":1}'
 
-curl -s localhost:8000/stats   # request / cache / token / cost counters
+curl -s localhost:8000/stats     # request / cache / token / cost / latency (JSON)
+curl -s localhost:8000/metrics   # the same counters in Prometheus text format
 ```
 
 The mock provider **echoes the prompt it is given**. That is intentional: because
@@ -139,12 +145,42 @@ docker run -p 8000:8000 inference-gateway      # offline mock stack by default
 ### Tests
 
 ```bash
-pytest        # 21 tests, all offline
+pytest        # 29 tests, all offline
 ```
 
 Covers: rate-limiter burst + refill, cache hit/miss + TTL, fallback on provider
 error, "all providers failed", token counting + cost, RAG retrieval returns the
-right chunk, and an end-to-end `/rag` call through the FastAPI app.
+right chunk, an end-to-end `/rag` call through the FastAPI app, and the
+observability additions (latency percentiles, miss/429 counters, `/metrics`).
+
+---
+
+## Metrics & Observability
+
+Two views of the same live counters, both offline and dependency-light:
+
+* **`GET /stats`** — a JSON snapshot for humans and quick `curl` checks.
+* **`GET /metrics`** — Prometheus text exposition (via `prometheus-client`) for
+  scrapers. A custom collector reads the gateway on each scrape, so `/stats` and
+  `/metrics` are guaranteed never to drift apart.
+
+`/stats` fields:
+
+| Field | Meaning |
+|---|---|
+| `requests` | total chat/RAG requests received |
+| `cache_hits` / `cache_misses` | responses served from cache vs. forwarded to a provider |
+| `provider_errors` | provider call failures (each drives a fallback attempt) |
+| `rate_limit_rejections` | requests rejected with HTTP 429 by the token bucket |
+| `total_prompt_tokens` / `total_completion_tokens` | cumulative token counts |
+| `total_cost_usd` | cumulative estimated spend ($0 on the mock model) |
+| `latency_ms_p50` / `latency_ms_p95` / `latency_ms_avg` | request latency over a bounded rolling window (last 1000 samples) |
+
+Latency is wall-clock (`time.perf_counter`) around the whole gateway pipeline, so
+a cache hit — which skips the provider — records a genuinely smaller latency than
+the miss that populated it. Each per-request response also carries its own
+`usage.latency_ms`. `/metrics` exposes the counters as Prometheus counters plus a
+`gateway_request_latency_ms` summary (`_count`/`_sum`) and p50/p95/avg gauges.
 
 ---
 
@@ -170,7 +206,7 @@ right chunk, and an end-to-end `/rag` call through the FastAPI app.
 | Tokenizer | regex approximation | real BPE (`tiktoken`) per model |
 | Auth | header echoed as identity | real API-key auth, quotas, tenants |
 | Caching correctness | caches all responses | opt-in / keyed on temperature (random outputs shouldn't cache) |
-| Observability | `/stats` counters | metrics, tracing, structured logs, alerts |
+| Observability | `/stats` JSON + Prometheus `/metrics` (counters + latency percentiles) | + distributed tracing, structured logs, alerting |
 | Prompt-injection defense | a "use only the context" system prompt | input/output filtering, allow-lists, eval harness |
 | Retrieval quality | top-k cosine, no eval | reranking, hybrid search, an eval set (recall@k) |
 
@@ -185,9 +221,9 @@ app/
   schemas.py         pydantic request/response models
   util.py            shared tokenizer
   providers/         base interface, mock (offline), openai-compatible (real)
-  gateway/           rate_limiter, cache, cost, router (the pipeline)
+  gateway/           rate_limiter, cache, cost, router (the pipeline), metrics (Prometheus)
   rag/               chunk, embed, store (NumPy cosine), pipeline
-tests/               21 offline tests
+tests/               29 offline tests
 ```
 
 This project deliberately extends the ideas from an earlier Go API gateway
