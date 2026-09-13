@@ -5,14 +5,14 @@ It sits in front of LLM providers and adds the operational glue you need before
 LLM calls are safe to expose to real traffic: **provider abstraction, per-key
 rate limiting, response caching, token/cost/latency tracking, streaming, provider
 fallback, and observability (`/stats` JSON + a Prometheus `/metrics` endpoint).**
-It also ships a **RAG route** (`/rag`) — document ingest → chunk →
-embed → vector store → retrieve → augment → generate — exposed through the *same*
+It also ships a **RAG route** (`/rag`): document ingest → chunk →
+embed → vector store → retrieve → augment → generate, exposed through the *same*
 gateway so RAG answers inherit all of the above.
 
 It is a portfolio project, and it is honest about that: it runs and is fully
 tested **offline** with a deterministic mock provider and a hashing embedder, and
 you can swap in a real provider/embedder with two environment variables. It is
-not an enterprise product clone — see [Trade-offs](#trade-offs--what-production-would-add).
+not an enterprise product clone. See [Trade-offs](#trade-offs--what-production-would-add).
 
 ---
 
@@ -21,7 +21,7 @@ not an enterprise product clone — see [Trade-offs](#trade-offs--what-productio
 Calling a provider SDK directly from every service works in a demo and breaks in
 production. Every call costs money **per token**, providers rate-limit and
 occasionally go down, identical prompts get re-sent, and nobody can see what is
-being spent. A gateway centralises those concerns in one place — the same reason
+being spent. A gateway centralises those concerns in one place, the same reason
 teams put an API gateway in front of microservices, applied to LLM traffic.
 
 ---
@@ -48,15 +48,15 @@ teams put an API gateway in front of microservices, applied to LLM traffic.
                                      └──────────────────────────────────────────────┘
 ```
 
-The offline default runs a **single** mock provider — step 3 is a one-element
+The offline default runs a **single** mock provider. Step 3 is a one-element
 chain. A real fallback chain (primary provider + a mock safety net) exists only
 with `PROVIDER=openai`, and is exercised directly in `tests/test_fallback.py`.
 
 Two halves, one pipeline:
 
-* **Gateway half** — `app/gateway/` (rate limiter, cache, cost, router) +
+* **Gateway half**: `app/gateway/` (rate limiter, cache, cost, router) +
   `app/providers/` (the pluggable backends behind one interface).
-* **RAG half** — `app/rag/` (chunk, embed, vector store, pipeline). The RAG
+* **RAG half**: `app/rag/` (chunk, embed, vector store, pipeline). The RAG
   pipeline calls the **same** `Gateway.chat()` for generation, so retrieval
   answers are rate-limited, cached, costed and fault-tolerant for free.
 
@@ -64,7 +64,7 @@ Two halves, one pipeline:
 
 `rate limit → cache → provider (with fallback) → cache store`. The order is
 deliberate: reject abusive keys most cheaply first, serve repeats from cache
-second, and only then spend a provider call — trying each provider in order and
+second, and only then spend a provider call, trying each provider in order and
 moving to the next on error.
 
 ### Request flow (RAG)
@@ -107,7 +107,7 @@ curl -s localhost:8000/metrics   # the same counters in Prometheus text format
 
 The mock provider **echoes the prompt it is given**. That is intentional: because
 the RAG pipeline injects the retrieved context into that prompt, the retrieved
-fact ("Canberra") shows up in the answer — which is exactly what lets the offline
+fact ("Canberra") shows up in the answer, which is exactly what lets the offline
 tests *prove* retrieval worked without a real model.
 
 ### With a real provider / embedder
@@ -159,8 +159,8 @@ observability additions (latency percentiles, miss/429 counters, `/metrics`).
 
 Two views of the same live counters, both offline and dependency-light:
 
-* **`GET /stats`** — a JSON snapshot for humans and quick `curl` checks.
-* **`GET /metrics`** — Prometheus text exposition (via `prometheus-client`) for
+* **`GET /stats`**: a JSON snapshot for humans and quick `curl` checks.
+* **`GET /metrics`**: Prometheus text exposition (via `prometheus-client`) for
   scrapers. A custom collector reads the gateway on each scrape, so `/stats` and
   `/metrics` are guaranteed never to drift apart.
 
@@ -177,7 +177,7 @@ Two views of the same live counters, both offline and dependency-light:
 | `latency_ms_p50` / `latency_ms_p95` / `latency_ms_avg` | request latency over a bounded rolling window (last 1000 samples) |
 
 Latency is wall-clock (`time.perf_counter`) around the whole gateway pipeline, so
-a cache hit — which skips the provider — records a genuinely smaller latency than
+a cache hit, which skips the provider, records a genuinely smaller latency than
 the miss that populated it. Each per-request response also carries its own
 `usage.latency_ms`. `/metrics` exposes the counters as Prometheus counters plus a
 `gateway_request_latency_ms` summary (`_count`/`_sum`) and p50/p95/avg gauges.
@@ -187,11 +187,11 @@ the miss that populated it. Each per-request response also carries its own
 ## Design choices worth calling out
 
 * **One tokenizer** (word/punctuation regex) shared by cost tracking and the
-  embedder. It approximates provider BPE billing — good enough to demonstrate the
+  embedder. It approximates provider BPE billing, good enough to demonstrate the
   mechanics, and it avoids a heavy `tiktoken`-style dependency + model download.
 * **Hashing embedder** (the "feature hashing" trick): each token hashes to a
   bucket in a fixed vector. Deterministic, offline, captures *lexical* overlap.
-  It does **not** capture semantics (synonyms) — an honest limitation, swapped out
+  It does **not** capture semantics (synonyms), an honest limitation, swapped out
   by `EMBEDDER=openai`.
 * **NumPy brute-force vector store** instead of FAISS/pgvector: exact, tiny, no
   heavy deps. Linear scan is fine at portfolio scale; an approximate index only
