@@ -7,7 +7,10 @@ rate limiting, response caching, token/cost/latency tracking, streaming, provide
 fallback, and observability (`/stats` JSON + a Prometheus `/metrics` endpoint).**
 It also ships a **RAG route** (`/rag`): document ingest → chunk →
 embed → vector store → retrieve → augment → generate, exposed through the *same*
-gateway so RAG answers inherit all of the above.
+gateway so RAG answers inherit all of the above. On top of that sits a **voice
+layer** (`/tts`, `/rag/speak`) that turns text, and retrieved RAG answers, into
+speech via ElevenLabs — with the same offline-first design, so it runs on a
+deterministic mock with no API key.
 
 It is a portfolio project, and it is honest about that: it runs and is fully
 tested **offline** with a deterministic mock provider and a hashing embedder, and
@@ -103,6 +106,15 @@ curl -s localhost:8000/rag/query -H 'content-type: application/json' \
 
 curl -s localhost:8000/stats     # request / cache / token / cost / latency (JSON)
 curl -s localhost:8000/metrics   # the same counters in Prometheus text format
+
+# voice: text -> speech (writes an audio file; mock bytes offline, real MP3 with a key)
+curl -s localhost:8000/tts -H 'content-type: application/json' \
+  -d '{"text":"The capital of Australia is Canberra."}' --output speech.mp3
+
+# voice: a RAG answer you can hear (ingest first, as above, then ask + speak)
+curl -s localhost:8000/rag/speak -H 'content-type: application/json' \
+  -d '{"query":"What is the capital of Australia?","top_k":1}' \
+  --output answer.mp3 --dump-header -   # X-RAG-* headers show what was retrieved
 ```
 
 The mock provider **echoes the prompt it is given**. That is intentional: because
@@ -134,6 +146,90 @@ uvicorn app.main:app
 | `RATE_LIMIT_PER_MIN` | `60` | tokens refilled per key per minute |
 | `RATE_LIMIT_BURST` | `10` | bucket capacity (max burst) |
 | `CACHE_TTL_SECONDS` | `300` | response cache TTL |
+| `TTS_PROVIDER` | `mock` | `mock` (offline) or `elevenlabs` |
+| `ELEVENLABS_API_KEY` | – | required when `TTS_PROVIDER=elevenlabs` |
+| `ELEVENLABS_VOICE_ID` | `21m00Tcm4TlvDq8ikWAM` | ElevenLabs voice id (default: "Rachel") |
+| `ELEVENLABS_MODEL` | `eleven_turbo_v2_5` | ElevenLabs model id |
+
+## Voice / Text-to-Speech (ElevenLabs)
+
+The gateway can speak. Two endpoints turn text into audio, and like everything
+else here they run offline by default: a deterministic **mock** TTS provider
+returns stable fake bytes so the routes, tests and Docker image all work with no
+API key and no network. Point `TTS_PROVIDER` at `elevenlabs` and the same code
+streams real MP3 from the ElevenLabs API instead.
+
+### Endpoints
+
+**`POST /tts`** — synthesise arbitrary text. Streams `audio/mpeg`.
+
+```bash
+curl -s localhost:8000/tts -H 'content-type: application/json' \
+  -d '{"text":"Hello from the gateway.","voice_id":"optional-override"}' \
+  --output speech.mp3
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `text` | yes | the text to speak (non-empty) |
+| `voice_id` | no | override the configured default voice for this call |
+
+**`POST /rag/speak`** — the headline feature: *RAG answers you can hear*. It runs
+the normal RAG query (embed → retrieve top-k → augment → generate through the
+gateway) and streams the generated answer back as speech. It takes the same body
+as `/rag/query` plus an optional `voice_id`. Provenance rides along in response
+headers so you know what was retrieved without decoding the audio:
+
+* `X-RAG-Doc-Ids` — comma-separated ids of the chunks used
+* `X-RAG-Chunks` — how many chunks were retrieved
+* `X-RAG-Answer-Preview` — an ASCII preview of the spoken answer
+
+```bash
+# ingest a fact first
+curl -s localhost:8000/rag/ingest -H 'content-type: application/json' \
+  -d '{"documents":["The capital of Australia is Canberra."],"doc_ids":["geo"]}'
+
+# then ask, and get the answer as audio
+curl -s localhost:8000/rag/speak -H 'content-type: application/json' \
+  -d '{"query":"What is the capital of Australia?","top_k":1}' \
+  --output answer.mp3 --dump-header -
+```
+
+The TTS request count and time-to-first-byte latency show up in `/stats`
+(`tts_requests`, `tts_latency_ms_p50/p95/avg`) and `/metrics`
+(`gateway_tts_requests_total`, `gateway_tts_latency_ms` summary + p50/p95
+gauges), using the same rolling-window mechanism as the chat latency numbers.
+
+### Offline (default) vs. real ElevenLabs
+
+Offline is the default and needs nothing:
+
+```bash
+uvicorn app.main:app        # TTS_PROVIDER defaults to mock -> deterministic bytes
+```
+
+The mock returns non-playable placeholder bytes whose length scales with the
+input text. That is enough to exercise and test the whole path offline; it is not
+real audio.
+
+For real speech you need a (free-tier is fine) ElevenLabs API key:
+
+```bash
+export TTS_PROVIDER=elevenlabs
+export ELEVENLABS_API_KEY=...                 # from elevenlabs.io
+export ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM   # optional; "Rachel" by default
+export ELEVENLABS_MODEL=eleven_turbo_v2_5         # optional
+uvicorn app.main:app
+# /tts and /rag/speak now stream real MP3 from ElevenLabs
+```
+
+Selecting `elevenlabs` without a key fails fast at startup with a clear error
+rather than going silently mute. Upstream failures are mapped to sensible codes:
+a `401` (bad key) surfaces as `502`, a `429` (quota) stays a `429`, and a timeout
+becomes a `504`. Under the hood it calls the ElevenLabs streaming endpoint
+(`POST /v1/text-to-speech/{voice_id}/stream`) with the `xi-api-key` header and
+hands the MP3 chunks straight through, so playback can start before synthesis
+finishes.
 
 ### Docker
 
@@ -145,13 +241,16 @@ docker run -p 8000:8000 inference-gateway      # offline mock stack by default
 ### Tests
 
 ```bash
-pytest        # 29 tests, all offline
+pytest        # 46 tests, all offline
 ```
 
 Covers: rate-limiter burst + refill, cache hit/miss + TTL, fallback on provider
 error, "all providers failed", token counting + cost, RAG retrieval returns the
-right chunk, an end-to-end `/rag` call through the FastAPI app, and the
-observability additions (latency percentiles, miss/429 counters, `/metrics`).
+right chunk, an end-to-end `/rag` call through the FastAPI app, the observability
+additions (latency percentiles, miss/429 counters, `/metrics`), and the voice
+layer (deterministic mock synthesis, `/tts` + `/rag/speak`, TTS stats/metrics,
+and the ElevenLabs request contract + error mapping verified against a fake
+transport — still no network).
 
 ---
 
@@ -209,6 +308,7 @@ the miss that populated it. Each per-request response also carries its own
 | Observability | `/stats` JSON + Prometheus `/metrics` (counters + latency percentiles) | + distributed tracing, structured logs, alerting |
 | Prompt-injection defense | a "use only the context" system prompt | input/output filtering, allow-lists, eval harness |
 | Retrieval quality | top-k cosine, no eval | reranking, hybrid search, an eval set (recall@k) |
+| Voice / TTS | ElevenLabs stream + offline mock, not cached | cache synthesised audio, batch long text, per-voice tuning |
 
 ---
 
@@ -223,7 +323,8 @@ app/
   providers/         base interface, mock (offline), openai-compatible (real)
   gateway/           rate_limiter, cache, cost, router (the pipeline), metrics (Prometheus)
   rag/               chunk, embed, store (NumPy cosine), pipeline
-tests/               29 offline tests
+  tts/               base interface, mock (offline), elevenlabs (real), engine (latency/counters)
+tests/               46 offline tests
 ```
 
 This project deliberately extends the ideas from an earlier Go API gateway
