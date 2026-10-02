@@ -20,6 +20,8 @@ from app.providers.base import Provider
 from app.providers.mock import MockProvider
 from app.rag.embed import Embedder, HashingEmbedder
 from app.rag.pipeline import RagPipeline
+from app.tts.engine import TTSEngine
+from app.tts.mock import MockTTSProvider
 
 
 def _env(name: str, default: str) -> str:
@@ -35,6 +37,13 @@ class Settings:
     rate_limit_per_min: int = 60
     rate_limit_burst: int = 10
     cache_ttl_seconds: int = 300
+    # --- Text-to-speech (voice layer) ---
+    tts_provider: str = "mock"      # mock | elevenlabs
+    elevenlabs_api_key: str | None = None
+    # Default voice "Rachel" — a stock ElevenLabs voice present on every account,
+    # so the real path works out of the box with just a key.
+    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"
+    elevenlabs_model: str = "eleven_turbo_v2_5"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -46,6 +55,10 @@ class Settings:
             rate_limit_per_min=int(_env("RATE_LIMIT_PER_MIN", "60")),
             rate_limit_burst=int(_env("RATE_LIMIT_BURST", "10")),
             cache_ttl_seconds=int(_env("CACHE_TTL_SECONDS", "300")),
+            tts_provider=_env("TTS_PROVIDER", "mock"),
+            elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY"),
+            elevenlabs_voice_id=_env("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
+            elevenlabs_model=_env("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
         )
 
 
@@ -96,3 +109,33 @@ def build_gateway(settings: Settings) -> Gateway:
 
 def build_rag(settings: Settings, gateway: Gateway) -> RagPipeline:
     return RagPipeline(embedder=build_embedder(settings), gateway=gateway)
+
+
+def build_tts(settings: Settings) -> TTSEngine:
+    """Build the voice engine. Default is the offline mock (no key, no network).
+
+    Only the elevenlabs path needs a key; selecting it without one is a hard
+    config error rather than a silent fallback, so a misconfigured deployment
+    fails fast instead of quietly going mute.
+    """
+    if settings.tts_provider == "elevenlabs":
+        if not settings.elevenlabs_api_key:
+            raise RuntimeError(
+                "TTS_PROVIDER=elevenlabs but ELEVENLABS_API_KEY is not set"
+            )
+        # Imported lazily so the httpx-based real provider isn't needed offline.
+        from app.tts.elevenlabs import ElevenLabsTTSProvider
+
+        provider = ElevenLabsTTSProvider(
+            settings.elevenlabs_api_key,
+            voice_id=settings.elevenlabs_voice_id,
+            model=settings.elevenlabs_model,
+        )
+        return TTSEngine(provider)
+
+    if settings.tts_provider == "mock":
+        return TTSEngine(MockTTSProvider())
+
+    raise RuntimeError(
+        f"unknown TTS_PROVIDER={settings.tts_provider!r} (expected 'mock' or 'elevenlabs')"
+    )

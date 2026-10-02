@@ -22,14 +22,18 @@ from prometheus_client.core import (
 )
 
 from app.gateway.router import Gateway
+from app.tts.engine import TTSEngine
 
 
 class GatewayCollector:
     """Translates a Gateway's live counters + latency window into Prometheus
     metric families at scrape time."""
 
-    def __init__(self, gateway: Gateway) -> None:
+    def __init__(self, gateway: Gateway, tts: TTSEngine | None = None) -> None:
         self.gateway = gateway
+        # Optional voice engine; when present its counters are emitted too, read
+        # live at scrape time exactly like the gateway's (no shadow counters).
+        self.tts = tts
 
     def collect(self):
         s = self.gateway._stats
@@ -84,15 +88,42 @@ class GatewayCollector:
             value=lat["latency_ms_avg"],
         )
 
+        # Voice layer, if wired. Same shape as the chat latency metrics so a
+        # dashboard can reuse the same panels.
+        if self.tts is not None:
+            yield CounterMetricFamily(
+                "gateway_tts_requests",
+                "Total text-to-speech synthesis requests.",
+                value=self.tts.count,
+            )
+            tts_win = self.tts.latencies
+            tts_lat = tts_win.summary()
+            yield SummaryMetricFamily(
+                "gateway_tts_latency_ms",
+                "Text-to-speech time-to-first-byte (ms) over a rolling window.",
+                count_value=tts_win.count,
+                sum_value=tts_win.total,
+            )
+            yield GaugeMetricFamily(
+                "gateway_tts_latency_ms_p50",
+                "Median TTS time-to-first-byte (ms) over the rolling window.",
+                value=tts_lat["latency_ms_p50"],
+            )
+            yield GaugeMetricFamily(
+                "gateway_tts_latency_ms_p95",
+                "95th-percentile TTS time-to-first-byte (ms) over the window.",
+                value=tts_lat["latency_ms_p95"],
+            )
 
-def build_registry(gateway: Gateway) -> CollectorRegistry:
+
+def build_registry(gateway: Gateway, tts: TTSEngine | None = None) -> CollectorRegistry:
     """A private registry holding only this gateway's collector.
 
     Using a fresh registry (instead of the global default) means importing this
     module has no global side effects and multiple gateways/tests never collide.
     """
     registry = CollectorRegistry()
-    registry.register(GatewayCollector(gateway))
+    registry.register(GatewayCollector(gateway, tts))
     return registry
 
 

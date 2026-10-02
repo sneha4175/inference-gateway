@@ -79,6 +79,20 @@ class RagQueryResponse(BaseModel):
     usage: Usage
 
 
+# --- TTS (voice) models ------------------------------------------------------
+class TTSRequest(BaseModel):
+    text: str = Field(min_length=1)
+    # Override the configured default voice for this one request (optional).
+    voice_id: str | None = None
+
+
+class RagSpeakRequest(RagQueryRequest):
+    """A RAG query whose answer is returned as speech. Same fields as a normal
+    RAG query, plus an optional per-request voice override."""
+
+    voice_id: str | None = None
+
+
 # --- Ops models --------------------------------------------------------------
 class Stats(BaseModel):
     requests: int
@@ -93,3 +107,9 @@ class Stats(BaseModel):
     latency_ms_p50: float
     latency_ms_p95: float
     latency_ms_avg: float
+    # Voice layer: synthesis request count + latency over its own rolling window.
+    # Default 0 so a gateway built without a TTS engine still serialises cleanly.
+    tts_requests: int = 0
+    tts_latency_ms_p50: float = 0.0
+    tts_latency_ms_p95: float = 0.0
+    tts_latency_ms_avg: float = 0.0
